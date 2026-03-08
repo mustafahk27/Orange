@@ -3,10 +3,36 @@ import Foundation
 final class HTTPPlannerClient: PlannerClient {
     private let baseURL: URL
     private let session: URLSession
+    private let telemetrySession: URLSession
+    private let planningRequestTimeout: TimeInterval
+    private let providerValidationTimeout: TimeInterval
+    private let telemetryTimeout: TimeInterval
 
-    init(baseURL: URL = URL(string: "http://127.0.0.1:7789")!, session: URLSession = .shared) {
+    init(
+        baseURL: URL = URL(string: "http://127.0.0.1:7789")!,
+        session: URLSession? = nil,
+        planningRequestTimeout: TimeInterval = 90.0,
+        providerValidationTimeout: TimeInterval = 30.0,
+        telemetryTimeout: TimeInterval = 2.0
+    ) {
         self.baseURL = baseURL
-        self.session = session
+        if let session {
+            self.session = session
+            self.telemetrySession = session
+        } else {
+            let configuration = URLSessionConfiguration.default
+            configuration.timeoutIntervalForRequest = planningRequestTimeout
+            configuration.timeoutIntervalForResource = 300.0
+            self.session = URLSession(configuration: configuration)
+
+            let telemetryConfiguration = URLSessionConfiguration.ephemeral
+            telemetryConfiguration.timeoutIntervalForRequest = telemetryTimeout
+            telemetryConfiguration.timeoutIntervalForResource = telemetryTimeout
+            self.telemetrySession = URLSession(configuration: telemetryConfiguration)
+        }
+        self.planningRequestTimeout = planningRequestTimeout
+        self.providerValidationTimeout = providerValidationTimeout
+        self.telemetryTimeout = telemetryTimeout
     }
 
     func plan(request: PlanRequest) async throws -> ActionPlan {
@@ -15,6 +41,7 @@ final class HTTPPlannerClient: PlannerClient {
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         urlRequest.httpBody = try JSONEncoder().encode(request)
+        urlRequest.timeoutInterval = planningRequestTimeout
 
         let (data, response) = try await session.data(for: urlRequest)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -23,7 +50,7 @@ final class HTTPPlannerClient: PlannerClient {
         guard (200 ... 299).contains(httpResponse.statusCode) else {
             let detail = parseServerDetail(from: data)
             throw PlannerServiceError.server(
-                message: detail?.message ?? "Planning request failed",
+                message: detail?.message ?? "Planning request failed (HTTP \(httpResponse.statusCode))",
                 errorCode: detail?.errorCode
             )
         }
@@ -37,6 +64,7 @@ final class HTTPPlannerClient: PlannerClient {
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         urlRequest.httpBody = try JSONEncoder().encode(request)
+        urlRequest.timeoutInterval = planningRequestTimeout
 
         let (data, response) = try await session.data(for: urlRequest)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -45,7 +73,7 @@ final class HTTPPlannerClient: PlannerClient {
         guard (200 ... 299).contains(httpResponse.statusCode) else {
             let detail = parseServerDetail(from: data)
             throw PlannerServiceError.server(
-                message: detail?.message ?? "Plan simulation failed",
+                message: detail?.message ?? "Plan simulation failed (HTTP \(httpResponse.statusCode))",
                 errorCode: detail?.errorCode
             )
         }
@@ -58,6 +86,7 @@ final class HTTPPlannerClient: PlannerClient {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = planningRequestTimeout
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
@@ -72,6 +101,7 @@ final class HTTPPlannerClient: PlannerClient {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = planningRequestTimeout
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -80,7 +110,7 @@ final class HTTPPlannerClient: PlannerClient {
         guard (200 ... 299).contains(httpResponse.statusCode) else {
             let detail = parseServerDetail(from: data)
             throw PlannerServiceError.server(
-                message: detail?.message ?? "Failed to fetch provider status",
+                message: detail?.message ?? "Failed to fetch provider status (HTTP \(httpResponse.statusCode))",
                 errorCode: detail?.errorCode
             )
         }
@@ -93,7 +123,7 @@ final class HTTPPlannerClient: PlannerClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(payload)
-        request.timeoutInterval = 20.0
+        request.timeoutInterval = providerValidationTimeout
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -102,7 +132,7 @@ final class HTTPPlannerClient: PlannerClient {
         guard (200 ... 299).contains(httpResponse.statusCode) else {
             let detail = parseServerDetail(from: data)
             throw PlannerServiceError.server(
-                message: detail?.message ?? "Provider validation failed",
+                message: detail?.message ?? "Provider validation failed (HTTP \(httpResponse.statusCode))",
                 errorCode: detail?.errorCode
             )
         }
@@ -116,9 +146,14 @@ final class HTTPPlannerClient: PlannerClient {
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONEncoder().encode(event)
-            _ = try await session.data(for: request)
+            request.timeoutInterval = telemetryTimeout
+            _ = try await telemetrySession.data(for: request)
         } catch {
-            Logger.error("Telemetry upload failed: \(error.localizedDescription)")
+            if let urlError = error as? URLError, urlError.code == .timedOut {
+                Logger.info("Telemetry skipped: sidecar busy")
+            } else {
+                Logger.info("Telemetry skipped: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -126,7 +161,10 @@ final class HTTPPlannerClient: PlannerClient {
         sessionId: String,
         plan: ActionPlan,
         executionStatus: ExecutionStatus,
+        failedActionId: String?,
+        completedActions: [String],
         reason: String?,
+        loopContext: LoopContext?,
         beforeContext: String?,
         afterContext: String?
     ) async throws -> VerifyResponse {
@@ -135,6 +173,9 @@ final class HTTPPlannerClient: PlannerClient {
             sessionId: sessionId,
             actionPlan: plan,
             executionResult: executionStatus,
+            failedActionId: failedActionId,
+            completedActions: completedActions,
+            loopContext: loopContext,
             reason: reason,
             beforeContext: beforeContext,
             afterContext: afterContext
@@ -145,6 +186,7 @@ final class HTTPPlannerClient: PlannerClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(payload)
+        request.timeoutInterval = planningRequestTimeout
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -153,7 +195,7 @@ final class HTTPPlannerClient: PlannerClient {
         guard (200 ... 299).contains(httpResponse.statusCode) else {
             let detail = parseServerDetail(from: data)
             throw PlannerServiceError.server(
-                message: detail?.message ?? "Verification request failed",
+                message: detail?.message ?? "Verification request failed (HTTP \(httpResponse.statusCode))",
                 errorCode: detail?.errorCode
             )
         }
@@ -169,6 +211,7 @@ final class HTTPPlannerClient: PlannerClient {
                     var request = URLRequest(url: endpoint)
                     request.httpMethod = "GET"
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    request.timeoutInterval = 0
 
                     let (bytes, response) = try await session.bytes(for: request)
                     guard let httpResponse = response as? HTTPURLResponse,
@@ -213,6 +256,15 @@ private func parseServerDetail(from data: Data) -> ServerErrorDetail? {
     if let detail = payload["detail"] as? String {
         return ServerErrorDetail(message: detail, errorCode: nil)
     }
+    if let details = payload["detail"] as? [[String: Any]],
+       let first = details.first {
+        let message = (first["msg"] as? String) ?? "Request validation failed"
+        let loc = (first["loc"] as? [Any])?
+            .map { String(describing: $0) }
+            .joined(separator: ".")
+        let composed = loc.map { "\(message) at \($0)" } ?? message
+        return ServerErrorDetail(message: composed, errorCode: nil)
+    }
     return nil
 }
 
@@ -221,6 +273,9 @@ private struct VerifyRequestPayload: Codable {
     let sessionId: String
     let actionPlan: ActionPlan
     let executionResult: ExecutionStatus
+    let failedActionId: String?
+    let completedActions: [String]
+    let loopContext: LoopContext?
     let reason: String?
     let beforeContext: String?
     let afterContext: String?
@@ -230,6 +285,9 @@ private struct VerifyRequestPayload: Codable {
         case sessionId = "session_id"
         case actionPlan = "action_plan"
         case executionResult = "execution_result"
+        case failedActionId = "failed_action_id"
+        case completedActions = "completed_actions"
+        case loopContext = "loop_context"
         case reason
         case beforeContext = "before_context"
         case afterContext = "after_context"

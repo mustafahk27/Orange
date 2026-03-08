@@ -6,8 +6,9 @@ from fastapi.testclient import TestClient
 
 from app import main as app_main
 from app.main import app
-from core.schemas import Action
+from core.schemas import Action, LoopContext
 from macos_use_adapter.adapter import AdapterResult
+from macos_use_adapter.adapter import MacOSUseAdapter
 
 
 client = TestClient(app)
@@ -50,7 +51,14 @@ def test_plan_invalid_key_format(monkeypatch) -> None:
 def test_plan_returns_actions_with_valid_key(monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-plan-key")
 
-    async def fake_plan_with_anthropic(*, transcript: str, active_app_name: str | None, ax_tree_summary: str | None, api_key: str) -> AdapterResult:  # noqa: ARG001
+    async def fake_plan_with_anthropic(
+        *,
+        transcript: str,
+        active_app_name: str | None,
+        ax_tree_summary: str | None,
+        api_key: str,
+        loop_context,
+    ) -> AdapterResult:  # noqa: ARG001
         return AdapterResult(
             actions=[Action(id="a1", kind="open_app", target="Safari", expected_outcome="Safari opened")],
             confidence=0.9,
@@ -73,6 +81,7 @@ def test_plan_returns_actions_with_valid_key(monkeypatch) -> None:
     assert body["session_id"] == "session-valid-key"
     assert body["actions"]
     assert body["actions"][0]["kind"] == "open_app"
+    assert body["goal_state"] == "in_progress"
 
 
 def test_provider_status_and_validate_endpoints(monkeypatch) -> None:
@@ -130,6 +139,63 @@ def test_verify_failure_returns_corrective_action() -> None:
     assert len(body["corrective_actions"]) == 1
 
 
+def test_verify_failure_retries_from_failed_action_forward() -> None:
+    plan = {
+        "schema_version": 1,
+        "session_id": "session-verify-suffix",
+        "actions": [
+            {"id": "a1", "kind": "click", "target": "Date cell", "timeout_ms": 3000, "destructive": False},
+            {"id": "a2", "kind": "type", "text": "iftar Drive", "timeout_ms": 3000, "destructive": False},
+            {"id": "a3", "kind": "key_combo", "key_combo": "enter", "timeout_ms": 3000, "destructive": False},
+        ],
+        "confidence": 0.8,
+        "risk_level": "low",
+        "requires_confirmation": False,
+    }
+    payload = {
+        "schema_version": 1,
+        "session_id": "session-verify-suffix",
+        "action_plan": plan,
+        "execution_result": "failure",
+        "failed_action_id": "a2",
+        "completed_actions": ["a1"],
+        "reason": "Typing failed",
+    }
+
+    response = client.post("/v1/verify", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "failure"
+    assert [item["kind"] for item in body["corrective_actions"]] == ["type", "key_combo"]
+
+
+def test_verify_success_without_delta_replans_without_corrective() -> None:
+    plan = {
+        "schema_version": 1,
+        "session_id": "session-verify-success-no-delta",
+        "actions": [
+            {"id": "a1", "kind": "click", "target": "Date cell", "timeout_ms": 3000, "destructive": False}
+        ],
+        "confidence": 0.8,
+        "risk_level": "low",
+        "requires_confirmation": False,
+    }
+    payload = {
+        "schema_version": 1,
+        "session_id": "session-verify-success-no-delta",
+        "action_plan": plan,
+        "execution_result": "success",
+        "before_context": "same",
+        "after_context": "same",
+    }
+
+    response = client.post("/v1/verify", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "failure"
+    assert body["corrective_actions"] == []
+
+
 def test_plan_simulate_requires_api_key(monkeypatch) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     payload = {
@@ -167,3 +233,364 @@ def test_telemetry_round_trip() -> None:
     body = get_response.json()
     assert len(body["events"]) == 1
     assert body["events"][0]["session_id"] == "session-t1"
+
+
+def test_plan_accepts_loop_context_and_complete_goal_state(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-plan-key")
+
+    async def fake_plan_with_anthropic(
+        *,
+        transcript: str,
+        active_app_name: str | None,
+        ax_tree_summary: str | None,
+        api_key: str,
+        loop_context,
+    ) -> AdapterResult:  # noqa: ARG001
+        assert loop_context is not None
+        return AdapterResult(
+            actions=[],
+            confidence=0.91,
+            summary="Goal complete",
+            warnings=[],
+            goal_state="complete",
+            planner_note="No further actions needed.",
+        )
+
+    monkeypatch.setattr(app_main._planner._adapter, "_plan_with_anthropic", fake_plan_with_anthropic)
+
+    payload = {
+        "schema_version": 1,
+        "session_id": "session-loop-complete",
+        "transcript": "create a reminder",
+        "app": {"name": "Notes"},
+        "loop_context": {
+            "goal_transcript": "create a reminder for tomorrow 5 pm",
+            "cycle_index": 2,
+            "replan_count": 1,
+            "max_cycles": 6,
+            "max_replans": 2,
+            "last_verify_status": "success",
+            "last_verify_reason": None,
+            "recent_action_results": [],
+        },
+    }
+    response = client.post("/v1/plan", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["goal_state"] == "complete"
+    assert body["planner_note"] == "No further actions needed."
+    assert body["actions"] == []
+
+
+def test_plan_trims_loop_actions_to_micro_batch(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-plan-key")
+
+    async def fake_plan_with_anthropic(
+        *,
+        transcript: str,
+        active_app_name: str | None,
+        ax_tree_summary: str | None,
+        api_key: str,
+        loop_context,
+    ) -> AdapterResult:  # noqa: ARG001
+        return AdapterResult(
+            actions=[
+                Action(id="a1", kind="click", target="one"),
+                Action(id="a2", kind="click", target="two"),
+                Action(id="a3", kind="click", target="three"),
+                Action(id="a4", kind="click", target="four"),
+            ],
+            confidence=0.8,
+            summary="Too many actions",
+            warnings=[],
+        )
+
+    monkeypatch.setattr(app_main._planner._adapter, "_plan_with_anthropic", fake_plan_with_anthropic)
+
+    payload = {
+        "schema_version": 1,
+        "session_id": "session-micro-batch",
+        "transcript": "do next step",
+        "app": {"name": "Notes"},
+        "loop_context": {
+            "goal_transcript": "goal",
+            "cycle_index": 1,
+            "replan_count": 0,
+            "max_cycles": 6,
+            "max_replans": 2,
+            "last_verify_status": "failure",
+            "last_verify_reason": "not found",
+            "recent_action_results": [],
+        },
+    }
+    response = client.post("/v1/plan", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["actions"]) == 3
+
+
+def test_coerce_actions_rejects_click_without_target() -> None:
+    adapter = MacOSUseAdapter()
+    actions, warnings = adapter._coerce_actions(
+        [
+            {"id": "a1", "kind": "click", "target": "   "},
+            {"id": "a2", "kind": "type", "text": "Avtar Drive"},
+        ]
+    )
+
+    assert len(actions) == 1
+    assert actions[0].kind == "type"
+    assert any("missing required field(s) target for kind 'click'" in warning for warning in warnings)
+
+
+def test_commit_required_state_filters_create_actions_and_forces_commit() -> None:
+    adapter = MacOSUseAdapter()
+    loop_context = LoopContext(
+        goal_transcript="complete form submission",
+        cycle_index=2,
+        replan_count=1,
+        max_cycles=10,
+        max_replans=4,
+        current_state="DATA_ENTERED",
+        next_required_state="COMMIT_ATTEMPTED",
+        last_state="FIELD_FOCUSED",
+        last_verify_status="failure",
+        last_verify_reason="Expected COMMIT_ATTEMPTED",
+        recent_action_results=[],
+    )
+    actions = [
+        Action(id="a1", kind="key_combo", key_combo="cmd+n"),
+        Action(id="a2", kind="type", text="Event at 5 pm"),
+        Action(id="a3", kind="key_combo", key_combo="tab"),
+    ]
+
+    guarded = adapter._enforce_loop_state_actions(actions=actions, loop_context=loop_context)
+
+    assert guarded
+    assert all(action.kind != "type" for action in guarded)
+    assert all((action.key_combo or "").lower().replace(" ", "") != "cmd+n" for action in guarded if action.kind == "key_combo")
+    assert any((action.key_combo or "").lower().replace(" ", "") in {"return", "enter", "cmd+s", "command+s"} for action in guarded if action.kind == "key_combo")
+
+
+def test_completed_required_state_filters_to_commit_only() -> None:
+    adapter = MacOSUseAdapter()
+    loop_context = LoopContext(
+        goal_transcript="complete form submission",
+        cycle_index=3,
+        replan_count=1,
+        max_cycles=10,
+        max_replans=4,
+        current_state="COMMIT_ATTEMPTED",
+        next_required_state="COMPLETED",
+        last_state="DATA_ENTERED",
+        last_verify_status="success",
+        last_verify_reason="commit attempted",
+        recent_action_results=[],
+    )
+    actions = [
+        Action(id="a1", kind="key_combo", key_combo="cmd+n"),
+        Action(id="a2", kind="type", text="Film event"),
+        Action(id="a3", kind="key_combo", key_combo="tab"),
+    ]
+
+    guarded = adapter._enforce_loop_state_actions(actions=actions, loop_context=loop_context)
+
+    assert guarded
+    assert all(action.kind != "type" for action in guarded)
+    assert all((action.key_combo or "").lower().replace(" ", "") != "cmd+n" for action in guarded if action.kind == "key_combo")
+    assert any((action.key_combo or "").lower().replace(" ", "") in {"return", "enter", "cmd+s", "command+s"} for action in guarded if action.kind == "key_combo")
+
+
+def test_verify_cmd_s_counts_as_commit_attempt() -> None:
+    plan = {
+        "schema_version": 1,
+        "session_id": "session-verify-commit-save",
+        "actions": [
+            {
+                "id": "a1",
+                "kind": "key_combo",
+                "key_combo": "cmd+s",
+                "timeout_ms": 3000,
+                "destructive": False,
+            }
+        ],
+        "confidence": 0.8,
+        "risk_level": "low",
+        "requires_confirmation": False,
+    }
+    payload = {
+        "schema_version": 1,
+        "session_id": "session-verify-commit-save",
+        "action_plan": plan,
+        "execution_result": "success",
+        "loop_context": {
+            "goal_transcript": "save event",
+            "cycle_index": 2,
+            "replan_count": 1,
+            "max_cycles": 10,
+            "max_replans": 4,
+            "current_state": "DATA_ENTERED",
+            "next_required_state": "COMMIT_ATTEMPTED",
+            "last_state": "FIELD_FOCUSED",
+            "last_verify_status": "failure",
+            "last_verify_reason": "needs commit",
+            "recent_action_results": [],
+        },
+        "before_context": "app=Notes, window=New Note, url=n/a, ax_lines=20",
+        "after_context": "app=Notes, window=New Note, url=n/a, ax_lines=20",
+    }
+
+    response = client.post("/v1/verify", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["state"] == "COMMIT_ATTEMPTED"
+
+
+def test_verify_completed_accepts_commit_attempted_progress() -> None:
+    plan = {
+        "schema_version": 1,
+        "session_id": "session-verify-completed-via-commit",
+        "actions": [
+            {
+                "id": "a1",
+                "kind": "key_combo",
+                "key_combo": "return",
+                "timeout_ms": 3000,
+                "destructive": False,
+            }
+        ],
+        "confidence": 0.8,
+        "risk_level": "low",
+        "requires_confirmation": False,
+    }
+    payload = {
+        "schema_version": 1,
+        "session_id": "session-verify-completed-via-commit",
+        "action_plan": plan,
+        "execution_result": "success",
+        "loop_context": {
+            "goal_transcript": "save event",
+            "cycle_index": 3,
+            "replan_count": 1,
+            "max_cycles": 10,
+            "max_replans": 4,
+            "current_state": "COMMIT_ATTEMPTED",
+            "next_required_state": "COMPLETED",
+            "last_state": "DATA_ENTERED",
+            "last_verify_status": "success",
+            "last_verify_reason": "commit attempted",
+            "recent_action_results": [],
+        },
+        "before_context": "app=Notes, window=New Note, url=n/a, ax_lines=20",
+        "after_context": "app=Notes, window=New Note, url=n/a, ax_lines=20",
+    }
+
+    response = client.post("/v1/verify", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["state"] == "COMMIT_ATTEMPTED"
+
+
+def test_verify_success_with_expected_state_progression() -> None:
+    plan = {
+        "schema_version": 1,
+        "session_id": "session-verify-state",
+        "actions": [
+            {
+                "id": "a1",
+                "kind": "key_combo",
+                "key_combo": "cmd+l",
+                "timeout_ms": 3000,
+                "destructive": False,
+            },
+            {
+                "id": "a2",
+                "kind": "type",
+                "text": "apple.com",
+                "timeout_ms": 3000,
+                "destructive": False,
+            },
+        ],
+        "confidence": 0.8,
+        "risk_level": "low",
+        "requires_confirmation": False,
+    }
+    payload = {
+        "schema_version": 1,
+        "session_id": "session-verify-state",
+        "action_plan": plan,
+        "execution_result": "success",
+        "loop_context": {
+            "goal_transcript": "open url",
+            "cycle_index": 0,
+            "replan_count": 0,
+            "max_cycles": 6,
+            "max_replans": 2,
+            "current_state": "APP_ACTIVE",
+            "next_required_state": "UI_CONTEXT_CHANGED",
+            "last_state": None,
+            "last_verify_status": "failure",
+            "last_verify_reason": "none",
+            "recent_action_results": [],
+        },
+        "before_context": "app=Safari, window=Window 1, url=about:blank, ax_lines=2",
+        "after_context": "app=Safari, window=Address Bar, url=https://apple.com, ax_lines=2",
+    }
+
+    response = client.post("/v1/verify", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["status"] == "success"
+    assert body["state"] == "UI_CONTEXT_CHANGED"
+    assert body["required_transition"] == "DATA_ENTERED"
+
+
+def test_verify_no_progress_for_redundant_open_app() -> None:
+    plan = {
+        "schema_version": 1,
+        "session_id": "session-verify-noop",
+        "actions": [
+            {
+                "id": "a1",
+                "kind": "open_app",
+                "target": "Notes",
+                "timeout_ms": 3000,
+                "destructive": False,
+            }
+        ],
+        "confidence": 0.8,
+        "risk_level": "low",
+        "requires_confirmation": False,
+    }
+    payload = {
+        "schema_version": 1,
+        "session_id": "session-verify-noop",
+        "action_plan": plan,
+        "execution_result": "success",
+        "loop_context": {
+            "goal_transcript": "open notes",
+            "cycle_index": 1,
+            "replan_count": 0,
+            "max_cycles": 6,
+            "max_replans": 2,
+            "current_state": "UI_CONTEXT_CHANGED",
+            "next_required_state": "FIELD_FOCUSED",
+            "last_state": "APP_ACTIVE",
+            "last_verify_status": "success",
+            "last_verify_reason": "previously opened",
+            "recent_action_results": [],
+        },
+        "before_context": "app=Notes, window=All iCloud, url=n/a, ax_lines=7",
+        "after_context": "app=Notes, window=All iCloud, url=n/a, ax_lines=7",
+    }
+
+    response = client.post("/v1/verify", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["status"] == "failure"
+    assert body["state"] == "APP_ACTIVE"
+    assert "Open-app action did not change active app or window" in body["reason"]

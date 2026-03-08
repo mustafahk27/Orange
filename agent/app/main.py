@@ -11,6 +11,7 @@ from core.schemas import (
     PlanRequest,
     PlanSimulationRequest,
     ProviderValidationRequest,
+    StreamEvent,
     TelemetryEvent,
     VerifyRequest,
 )
@@ -75,7 +76,17 @@ async def models() -> JSONResponse:
 
 @app.post("/v1/verify")
 async def verify(request: VerifyRequest) -> JSONResponse:
-    result = await _verifier.verify(request)
+    result = _verifier.verify(request)
+    if result.status == "failure" and result.corrective_actions:
+        await _event_bus.publish(
+            StreamEvent(
+                session_id=request.session_id,
+                event="loop_retry_corrective",
+                message="Verifier suggested corrective actions",
+                progress=78,
+                severity="warning",
+            )
+        )
     return JSONResponse(result.model_dump(mode="json"))
 
 

@@ -6,6 +6,7 @@ struct PlanRequest: Codable {
     let transcript: String
     let screenshotBase64: String?
     let axTreeSummary: String?
+    let loopContext: LoopContext?
     let app: AppMetadata
     let preferences: PlannerPreferences?
 
@@ -15,8 +16,53 @@ struct PlanRequest: Codable {
         case transcript
         case screenshotBase64 = "screenshot_base64"
         case axTreeSummary = "ax_tree_summary"
+        case loopContext = "loop_context"
         case app
         case preferences
+    }
+}
+
+struct LoopActionOutcome: Codable {
+    let actionId: String
+    let kind: String
+    let status: String
+    let errorCode: String?
+    let actionHint: String?
+
+    enum CodingKeys: String, CodingKey {
+        case actionId = "action_id"
+        case kind
+        case status
+        case errorCode = "error_code"
+        case actionHint = "action_hint"
+    }
+}
+
+struct LoopContext: Codable {
+    let goalTranscript: String
+    let cycleIndex: Int
+    let replanCount: Int
+    let maxCycles: Int
+    let maxReplans: Int
+    let currentState: String?
+    let nextRequiredState: String?
+    let lastState: String?
+    let lastVerifyStatus: String?
+    let lastVerifyReason: String?
+    let recentActionResults: [LoopActionOutcome]
+
+    enum CodingKeys: String, CodingKey {
+        case goalTranscript = "goal_transcript"
+        case cycleIndex = "cycle_index"
+        case replanCount = "replan_count"
+        case maxCycles = "max_cycles"
+        case maxReplans = "max_replans"
+        case currentState = "current_state"
+        case nextRequiredState = "next_required_state"
+        case lastState = "last_state"
+        case lastVerifyStatus = "last_verify_status"
+        case lastVerifyReason = "last_verify_reason"
+        case recentActionResults = "recent_action_results"
     }
 }
 
@@ -78,6 +124,10 @@ struct VerifyResponse: Codable {
     let status: String
     let confidence: Double
     let reason: String?
+    let state: String?
+    let requiredTransition: String?
+    let stateReason: String?
+    let correctiveActions: [AgentAction]
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -85,6 +135,10 @@ struct VerifyResponse: Codable {
         case status
         case confidence
         case reason
+        case state
+        case requiredTransition = "required_transition"
+        case stateReason = "state_reason"
+        case correctiveActions = "corrective_actions"
     }
 }
 
@@ -181,7 +235,10 @@ protocol PlannerClient {
         sessionId: String,
         plan: ActionPlan,
         executionStatus: ExecutionStatus,
+        failedActionId: String?,
+        completedActions: [String],
         reason: String?,
+        loopContext: LoopContext?,
         beforeContext: String?,
         afterContext: String?
     ) async throws -> VerifyResponse

@@ -2,6 +2,7 @@ import Foundation
 
 enum ActionKind: String, Codable, CaseIterable {
     case click
+    case doubleClick = "double_click"
     case type
     case keyCombo = "key_combo"
     case scroll
@@ -43,6 +44,8 @@ struct ActionPlan: Codable {
     let riskLevel: String
     let requiresConfirmation: Bool
     let summary: String?
+    let goalState: String?
+    let plannerNote: String?
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -52,6 +55,8 @@ struct ActionPlan: Codable {
         case riskLevel = "risk_level"
         case requiresConfirmation = "requires_confirmation"
         case summary
+        case goalState = "goal_state"
+        case plannerNote = "planner_note"
     }
 }
 
@@ -108,6 +113,14 @@ struct SessionTelemetryEvent: Codable {
     let status: String
     let latencyMs: Int?
     let errorCode: String?
+    let cycleIndex: Int?
+    let replanCount: Int?
+    let terminationReason: String?
+    let loopState: String?
+    let stateTransition: String?
+    let actionFingerprint: String?
+    let fingerprintRepeatCount: Int?
+    let reasonNoProgress: String?
 
     enum CodingKeys: String, CodingKey {
         case sessionId = "session_id"
@@ -118,6 +131,14 @@ struct SessionTelemetryEvent: Codable {
         case status
         case latencyMs = "latency_ms"
         case errorCode = "error_code"
+        case cycleIndex = "cycle_index"
+        case replanCount = "replan_count"
+        case terminationReason = "termination_reason"
+        case loopState = "loop_state"
+        case stateTransition = "state_transition"
+        case actionFingerprint = "action_fingerprint"
+        case fingerprintRepeatCount = "fingerprint_repeat_count"
+        case reasonNoProgress = "reason_no_progress"
     }
 }
 

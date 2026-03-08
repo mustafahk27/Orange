@@ -36,3 +36,6 @@ agent/build/
 agent/dist/
 agent/*.spec
 .vercel
+
+AGENT.md 
+AGENT_STABILIZATION_TODO.md

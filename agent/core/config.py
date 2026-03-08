@@ -18,6 +18,8 @@ class Settings:
     model_complex: str = os.getenv("ORANGE_MODEL_COMPLEX", "claude-3-5-sonnet-latest")
     enable_remote_llm: bool = os.getenv("ORANGE_ENABLE_REMOTE_LLM", "1") == "1"
     anthropic_api_base: str = os.getenv("ANTHROPIC_API_BASE", "https://api.anthropic.com")
+    anthropic_validate_timeout_seconds: float = float(os.getenv("ORANGE_ANTHROPIC_VALIDATE_TIMEOUT_SECONDS", "20"))
+    anthropic_plan_timeout_seconds: float = float(os.getenv("ORANGE_ANTHROPIC_PLAN_TIMEOUT_SECONDS", "60"))
     safety_strictness: str = os.getenv("ORANGE_SAFETY_STRICTNESS", "strict")
     model_overrides_raw: str = os.getenv("ORANGE_MODEL_OVERRIDES", "")
 

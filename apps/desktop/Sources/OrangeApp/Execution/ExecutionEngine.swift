@@ -71,7 +71,9 @@ final class ActionExecutor: ExecutionEngine {
         case .wait:
             try wait(action)
         case .click:
-            try withRetry { try clickTarget(action.target) }
+            try withRetry { try clickTarget(action.target, clickCount: 1) }
+        case .doubleClick:
+            try withRetry { try clickTarget(action.target, clickCount: 2) }
         case .scroll:
             try scrollTarget(action.target)
         case .selectMenuItem:
@@ -135,6 +137,9 @@ final class ActionExecutor: ExecutionEngine {
     private func typeText(_ text: String?) throws {
         guard let text, !text.isEmpty else {
             throw ActionExecutionError.invalidActionPayload("Missing text for type action")
+        }
+        guard ensureFocusedApplicationAvailable() != nil else {
+            throw ActionExecutionError.elementNotFound("Focused app unavailable")
         }
         let escaped = escapeAppleScriptText(text)
         try runAppleScript(
@@ -200,7 +205,7 @@ final class ActionExecutor: ExecutionEngine {
         }
     }
 
-    private func clickTarget(_ target: String?) throws {
+    private func clickTarget(_ target: String?, clickCount: Int) throws {
         guard AXIsProcessTrusted() else {
             throw ActionExecutionError.permissions("Accessibility permission is required for click actions")
         }
@@ -208,11 +213,9 @@ final class ActionExecutor: ExecutionEngine {
             throw ActionExecutionError.invalidActionPayload("Missing target for click action")
         }
 
-        let systemWide = AXUIElementCreateSystemWide()
-        guard let focusedAppAny = copyAttribute(systemWide, attribute: kAXFocusedApplicationAttribute as CFString) else {
+        guard let focusedApp = ensureFocusedApplicationAvailable() else {
             throw ActionExecutionError.elementNotFound("Focused app unavailable")
         }
-        let focusedApp = focusedAppAny as! AXUIElement
 
         let rootElement: AXUIElement
         if let windowAny = copyAttribute(focusedApp, attribute: kAXFocusedWindowAttribute as CFString) {
@@ -221,14 +224,25 @@ final class ActionExecutor: ExecutionEngine {
             rootElement = focusedApp
         }
 
-        guard let element = findElement(containing: target, in: rootElement, maxDepth: 8, maxNodes: 500) else {
+        guard let matchedElement = findElement(containing: target, in: rootElement, maxDepth: 8, maxNodes: 500) else {
             throw ActionExecutionError.elementNotFound("Could not find element matching target '\(target)'")
         }
-
-        let pressResult = AXUIElementPerformAction(element, kAXPressAction as CFString)
-        if pressResult != .success {
-            throw ActionExecutionError.elementInteractionFailed("Press action failed with AXError \(pressResult.rawValue)")
+        let element = interactionElement(for: matchedElement)
+        let matchedRole = (copyAttribute(matchedElement, attribute: kAXRoleAttribute as CFString) as? String) ?? "UnknownRole"
+        let interactionRole = (copyAttribute(element, attribute: kAXRoleAttribute as CFString) as? String) ?? "UnknownRole"
+        if matchedRole != interactionRole {
+            Logger.info("Promoted interaction target from role \(matchedRole) to \(interactionRole) for '\(target)'")
         }
+
+        if try pressElementOrAncestor(element) {
+            return
+        }
+
+        if try clickElementByCoordinates(element, clickCount: clickCount) {
+            return
+        }
+
+        throw ActionExecutionError.elementInteractionFailed("Could not interact with target '\(target)' using AXPress or coordinate click")
     }
 
     private func scrollTarget(_ target: String?) throws {
@@ -387,12 +401,123 @@ final class ActionExecutor: ExecutionEngine {
         return value
     }
 
+    private func copyElementAttribute(_ element: AXUIElement, attribute: CFString) -> AXUIElement? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
+        guard result == .success, let value else { return nil }
+        guard CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return unsafeBitCast(value, to: AXUIElement.self)
+    }
+
+    private func copyAXValueAttribute(_ element: AXUIElement, attribute: CFString) -> AXValue? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(element, attribute, &value)
+        guard result == .success, let value else { return nil }
+        guard CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        return unsafeBitCast(value, to: AXValue.self)
+    }
+
+    private func copyActionNames(_ element: AXUIElement) -> [String] {
+        var namesRef: CFArray?
+        let result = AXUIElementCopyActionNames(element, &namesRef)
+        guard result == .success, let namesRef else { return [] }
+        return (namesRef as [AnyObject]).compactMap { $0 as? String }
+    }
+
+    private func pressElementOrAncestor(_ element: AXUIElement, maxAncestorDepth: Int = 4) throws -> Bool {
+        var current: AXUIElement? = element
+        var depth = 0
+
+        while let candidate = current, depth <= maxAncestorDepth {
+            let actions = copyActionNames(candidate)
+            if actions.contains(kAXPressAction as String) {
+                let result = AXUIElementPerformAction(candidate, kAXPressAction as CFString)
+                if result == .success {
+                    return true
+                }
+                Logger.info("AXPress failed at depth \(depth) with AXError \(result.rawValue); trying fallback")
+            }
+
+            current = copyElementAttribute(candidate, attribute: kAXParentAttribute as CFString)
+            depth += 1
+        }
+
+        return false
+    }
+
+    private func clickElementByCoordinates(_ element: AXUIElement, clickCount: Int, maxAncestorDepth: Int = 4) throws -> Bool {
+        var current: AXUIElement? = element
+        var depth = 0
+
+        while let candidate = current, depth <= maxAncestorDepth {
+            if let point = elementCenter(candidate) {
+                try postMouseClick(at: point, clickCount: max(1, clickCount))
+                return true
+            }
+            current = copyElementAttribute(candidate, attribute: kAXParentAttribute as CFString)
+            depth += 1
+        }
+        return false
+    }
+
+    private func elementCenter(_ element: AXUIElement) -> CGPoint? {
+        if let positionValue = copyAXValueAttribute(element, attribute: kAXPositionAttribute as CFString),
+           let sizeValue = copyAXValueAttribute(element, attribute: kAXSizeAttribute as CFString)
+        {
+            var position = CGPoint.zero
+            var size = CGSize.zero
+            if AXValueGetType(positionValue) == .cgPoint,
+               AXValueGetType(sizeValue) == .cgSize,
+               AXValueGetValue(positionValue, .cgPoint, &position),
+               AXValueGetValue(sizeValue, .cgSize, &size),
+               size.width > 1,
+               size.height > 1
+            {
+                return CGPoint(x: position.x + (size.width / 2.0), y: position.y + (size.height / 2.0))
+            }
+        }
+        return nil
+    }
+
+    private func postMouseClick(at point: CGPoint, clickCount: Int) throws {
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            throw ActionExecutionError.systemEventCreationFailed
+        }
+
+        for idx in 1 ... clickCount {
+            guard let mouseDown = CGEvent(
+                mouseEventSource: source,
+                mouseType: .leftMouseDown,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            ),
+            let mouseUp = CGEvent(
+                mouseEventSource: source,
+                mouseType: .leftMouseUp,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            ) else {
+                throw ActionExecutionError.systemEventCreationFailed
+            }
+
+            mouseDown.setIntegerValueField(.mouseEventClickState, value: Int64(idx))
+            mouseUp.setIntegerValueField(.mouseEventClickState, value: Int64(idx))
+            mouseDown.post(tap: .cghidEventTap)
+            mouseUp.post(tap: .cghidEventTap)
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }
+
     private func findElement(
         containing target: String,
         in root: AXUIElement,
         maxDepth: Int,
         maxNodes: Int
     ) -> AXUIElement? {
+        if let indexed = findElementByIndex(containing: target, in: root, maxDepth: maxDepth, maxNodes: maxNodes) {
+            return indexed
+        }
+
         let needle = target.lowercased()
         let tokens = needle
             .split(whereSeparator: { $0.isWhitespace || $0.isPunctuation })
@@ -433,6 +558,110 @@ final class ActionExecutor: ExecutionEngine {
         return best?.element
     }
 
+    private func findElementByIndex(
+        containing target: String,
+        in root: AXUIElement,
+        maxDepth: Int,
+        maxNodes: Int
+    ) -> AXUIElement? {
+        guard let requestedIndex = indexedTargetValue(from: target) else {
+            return nil
+        }
+
+        var queue: [(AXUIElement, Int)] = [(root, 0)]
+        var visited = 0
+        while !queue.isEmpty, visited < maxNodes {
+            let (element, depth) = queue.removeFirst()
+            visited += 1
+            if visited == requestedIndex {
+                Logger.info("AX matcher resolved direct index [\(requestedIndex)]")
+                return element
+            }
+
+            guard depth < maxDepth else { continue }
+            if let children = copyAttribute(element, attribute: kAXChildrenAttribute as CFString) as? [AnyObject] {
+                for child in children {
+                    queue.append((child as! AXUIElement, depth + 1))
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private func indexedTargetValue(from target: String) -> Int? {
+        let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("["),
+           let closing = trimmed.firstIndex(of: "]") {
+            let digits = trimmed[trimmed.index(after: trimmed.startIndex) ..< closing]
+            return Int(digits)
+        }
+        let compact = trimmed.filter { !$0.isWhitespace }
+        guard !compact.isEmpty else { return nil }
+        guard compact.allSatisfy(\.isNumber) else { return nil }
+        return Int(compact)
+    }
+
+    private func interactionElement(for element: AXUIElement, maxAncestorDepth: Int = 4) -> AXUIElement {
+        var current = element
+        var depth = 0
+
+        while depth <= maxAncestorDepth {
+            let role = (copyAttribute(current, attribute: kAXRoleAttribute as CFString) as? String) ?? ""
+            let actions = copyActionNames(current)
+            if actions.contains(kAXPressAction as String) || actionableRoles.contains(role) {
+                Logger.info("Found actionable interaction node at depth \(depth) with role \(role)")
+                return current
+            }
+            guard let parent = copyElementAttribute(current, attribute: kAXParentAttribute as CFString) else {
+                break
+            }
+            current = parent
+            depth += 1
+        }
+
+        if let descendant = findInteractiveDescendant(from: element, maxDepth: maxAncestorDepth) {
+            Logger.info("No actionable ancestor found for matched target; using interactive descendant fallback")
+            return descendant
+        }
+
+        return element
+    }
+
+    private func findInteractiveDescendant(from element: AXUIElement, maxDepth: Int) -> AXUIElement? {
+        var queue: [(AXUIElement, Int)] = [(element, 0)]
+        while !queue.isEmpty {
+            let (candidate, depth) = queue.removeFirst()
+            let role = (copyAttribute(candidate, attribute: kAXRoleAttribute as CFString) as? String) ?? ""
+            let actions = copyActionNames(candidate)
+            if actions.contains(kAXPressAction as String) || actionableRoles.contains(role) {
+                return candidate
+            }
+            guard depth < maxDepth else { continue }
+            if let children = copyAttribute(candidate, attribute: kAXChildrenAttribute as CFString) as? [AnyObject] {
+                for child in children {
+                    queue.append((child as! AXUIElement, depth + 1))
+                }
+            }
+        }
+        return nil
+    }
+
+    private var actionableRoles: Set<String> {
+        [
+            kAXButtonRole as String,
+            kAXCellRole as String,
+            kAXRowRole as String,
+            kAXMenuItemRole as String,
+            "AXLink",
+            kAXTextFieldRole as String,
+            kAXPopUpButtonRole as String,
+            kAXRadioButtonRole as String,
+            kAXCheckBoxRole as String,
+            kAXTabGroupRole as String
+        ]
+    }
+
     private func elementScore(_ element: AXUIElement, needle: String, tokens: [String]) -> Int {
         let fields: [(CFString, Int)] = [
             (kAXTitleAttribute as CFString, 8),
@@ -461,11 +690,9 @@ final class ActionExecutor: ExecutionEngine {
 
     private func isElementPresent(_ target: String) -> Bool {
         guard AXIsProcessTrusted() else { return false }
-        let systemWide = AXUIElementCreateSystemWide()
-        guard let focusedAppAny = copyAttribute(systemWide, attribute: kAXFocusedApplicationAttribute as CFString) else {
+        guard let focusedApp = ensureFocusedApplicationAvailable() else {
             return false
         }
-        let focusedApp = focusedAppAny as! AXUIElement
         let root: AXUIElement
         if let windowAny = copyAttribute(focusedApp, attribute: kAXFocusedWindowAttribute as CFString) {
             root = windowAny as! AXUIElement
@@ -473,6 +700,58 @@ final class ActionExecutor: ExecutionEngine {
             root = focusedApp
         }
         return findElement(containing: target, in: root, maxDepth: 7, maxNodes: 500) != nil
+    }
+
+    private func focusedApplicationElement() -> AXUIElement? {
+        let systemWide = AXUIElementCreateSystemWide()
+        if let focusedAppAny = copyAttribute(
+            systemWide,
+            attribute: kAXFocusedApplicationAttribute as CFString
+        ) {
+            return (focusedAppAny as! AXUIElement)
+        }
+        if let focusedUIElementAny = copyAttribute(
+            systemWide,
+            attribute: kAXFocusedUIElementAttribute as CFString
+        ) {
+            let focusedUIElement = focusedUIElementAny as! AXUIElement
+            var pid: pid_t = 0
+            if AXUIElementGetPid(focusedUIElement, &pid) == .success, pid > 0 {
+                return AXUIElementCreateApplication(pid)
+            }
+        }
+        if let app = frontmostRunningApplication() {
+            return AXUIElementCreateApplication(app.processIdentifier)
+        }
+        return nil
+    }
+
+    private func ensureFocusedApplicationAvailable(
+        timeout: TimeInterval = 0.9,
+        pollInterval: TimeInterval = 0.06
+    ) -> AXUIElement? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() <= deadline {
+            if let focusedApp = focusedApplicationElement() {
+                return focusedApp
+            }
+            if let app = frontmostRunningApplication() {
+                _ = app.activate(options: [])
+            }
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+        return focusedApplicationElement()
+    }
+
+    private func frontmostRunningApplication() -> NSRunningApplication? {
+        if Thread.isMainThread {
+            return NSWorkspace.shared.frontmostApplication
+        }
+        var app: NSRunningApplication?
+        DispatchQueue.main.sync {
+            app = NSWorkspace.shared.frontmostApplication
+        }
+        return app
     }
 
     private func withRetry<T>(
@@ -508,6 +787,9 @@ final class ActionExecutor: ExecutionEngine {
             }
             if description.contains("Element not found") {
                 return "element_not_found"
+            }
+            if description.contains("Element interaction failed") {
+                return "element_interaction_failed"
             }
             if description.contains("AppleScript") {
                 return "applescript_failed"

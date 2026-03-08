@@ -38,12 +38,45 @@ class PlannerService:
                 severity="info",
             )
         )
+        if request.loop_context is not None:
+            await self._event_bus.publish(
+                StreamEvent(
+                    session_id=request.session_id,
+                    event="loop_cycle_started",
+                    message=f"Loop cycle {request.loop_context.cycle_index + 1}/{request.loop_context.max_cycles}",
+                    progress=8,
+                    severity="info",
+                )
+            )
+            if request.loop_context.replan_count > 0:
+                await self._event_bus.publish(
+                    StreamEvent(
+                        session_id=request.session_id,
+                        event="loop_replan",
+                        message=f"Replan attempt {request.loop_context.replan_count}/{request.loop_context.max_replans}",
+                        progress=9,
+                        severity="info",
+                    )
+                )
 
         adapter_result = await self._adapter.plan_actions(
             transcript=request.transcript,
             active_app_name=(request.app.name if request.app else None),
             _ax_tree_summary=request.ax_tree_summary,
+            loop_context=request.loop_context,
         )
+        actions = adapter_result.actions
+        if request.loop_context is not None and len(actions) > 3:
+            actions = actions[:3]
+            await self._event_bus.publish(
+                StreamEvent(
+                    session_id=request.session_id,
+                    event="planning_warning",
+                    message="Trimmed micro-step plan to 3 actions",
+                    progress=42,
+                    severity="warning",
+                )
+            )
 
         for warning in getattr(adapter_result, "warnings", []):
             await self._event_bus.publish(
@@ -60,23 +93,46 @@ class PlannerService:
             StreamEvent(
                 session_id=request.session_id,
                 event="planning_generated",
-                message=f"Generated {len(adapter_result.actions)} actions",
+                message=f"Generated {len(actions)} actions",
                 progress=65,
                 severity="info",
             )
         )
 
-        risk_level, requires_confirmation = self._compute_risk(adapter_result.actions, transcript=request.transcript)
+        risk_level, requires_confirmation = self._compute_risk(actions, transcript=request.transcript)
 
         plan = ActionPlan(
             schema_version=SCHEMA_VERSION_CURRENT,
             session_id=request.session_id,
-            actions=adapter_result.actions,
+            actions=actions,
             confidence=adapter_result.confidence,
             risk_level=risk_level,
             requires_confirmation=requires_confirmation,
             summary=adapter_result.summary if not getattr(adapter_result, "recovery_guidance", None) else f"{adapter_result.summary}. {adapter_result.recovery_guidance}",
+            goal_state=adapter_result.goal_state,  # type: ignore[arg-type]
+            planner_note=adapter_result.planner_note,
         )
+
+        if plan.goal_state == "complete":
+            await self._event_bus.publish(
+                StreamEvent(
+                    session_id=request.session_id,
+                    event="loop_completed",
+                    message="Planner marked task complete",
+                    progress=95,
+                    severity="info",
+                )
+            )
+        elif plan.goal_state == "blocked":
+            await self._event_bus.publish(
+                StreamEvent(
+                    session_id=request.session_id,
+                    event="loop_budget_exhausted",
+                    message=plan.planner_note or "Planner marked task blocked",
+                    progress=95,
+                    severity="warning",
+                )
+            )
 
         await self._event_bus.publish(
             StreamEvent(
@@ -94,6 +150,7 @@ class PlannerService:
             transcript=request.transcript,
             active_app_name=(request.app.name if request.app else None),
             _ax_tree_summary=None,
+            loop_context=None,
         )
         risk_level, requires_confirmation = self._compute_risk(adapter_result.actions, transcript=request.transcript)
         warnings = getattr(adapter_result, "warnings", [])

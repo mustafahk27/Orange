@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from core.config import settings
-from core.schemas import Action
+from core.schemas import Action, LoopContext
 
 
 @dataclass
@@ -20,6 +20,8 @@ class AdapterResult:
     confidence: float
     summary: str
     warnings: list[str]
+    goal_state: str = "in_progress"
+    planner_note: str | None = None
     recovery_guidance: str | None = None
 
 
@@ -52,6 +54,7 @@ class MacOSUseAdapter:
 
     _allowed_action_kinds = {
         "click",
+        "double_click",
         "type",
         "key_combo",
         "scroll",
@@ -60,6 +63,16 @@ class MacOSUseAdapter:
         "select_menu_item",
         "wait",
     }
+
+    _fallback_model_candidates = (
+        "claude-3-5-sonnet-latest",
+        "claude-3-5-haiku-latest",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+        "claude-3-opus-20240229",
+        "claude-3-sonnet-20240229",
+        "claude-3-haiku-20240307",
+    )
 
     @property
     def provider_name(self) -> str:
@@ -78,13 +91,17 @@ class MacOSUseAdapter:
         if not settings.enable_remote_llm:
             return ProviderValidationResult(valid=True, reason="Remote provider calls are disabled")
 
-        url = f"{settings.anthropic_api_base.rstrip('/')}/v1/models"
+        url = f"{self._api_base()}/v1/models"
         headers = {
             "x-api-key": key,
             "anthropic-version": "2023-06-01",
         }
+        validate_timeout = httpx.Timeout(
+            timeout=settings.anthropic_validate_timeout_seconds,
+            connect=min(10.0, settings.anthropic_validate_timeout_seconds),
+        )
         try:
-            async with httpx.AsyncClient(timeout=12.0) as client:
+            async with httpx.AsyncClient(timeout=validate_timeout) as client:
                 response = await client.get(url, headers=headers)
         except httpx.RequestError:
             return ProviderValidationResult(valid=False, reason="Network error while validating key")
@@ -107,6 +124,25 @@ class MacOSUseAdapter:
 
         return ProviderValidationResult(valid=False, reason=f"Provider rejected key ({response.status_code})")
 
+    @staticmethod
+    def _api_base() -> str:
+        base = settings.anthropic_api_base.rstrip("/")
+        if base.endswith("/v1"):
+            return base[:-3]
+        return base
+
+    def _model_candidates(self, primary_model: str) -> list[str]:
+        candidates = [primary_model]
+        for model in self._fallback_model_candidates:
+            if model not in candidates:
+                candidates.append(model)
+        return candidates
+
+    @staticmethod
+    def _looks_like_model_not_found(body: dict[str, Any]) -> bool:
+        flattened = json.dumps(body).lower()
+        return "not_found" in flattened or "not found" in flattened
+
     def _load_vendor_prompt_rules(self) -> None:
         vendor_path = settings.vendor_macos_use
         if not vendor_path.exists():
@@ -118,7 +154,7 @@ class MacOSUseAdapter:
 
             prompt = SystemPrompt(
                 action_description=(
-                    "open_app, click, type, key_combo, scroll, run_applescript, select_menu_item, wait"
+                    "open_app, click, double_click, type, key_combo, scroll, run_applescript, select_menu_item, wait"
                 ),
                 current_date=datetime.now(),
                 max_actions_per_step=4,
@@ -154,9 +190,15 @@ class MacOSUseAdapter:
         transcript: str,
         active_app_name: str | None,
         _ax_tree_summary: str | None,
+        loop_context: LoopContext | None,
     ) -> AdapterResult:
         if not settings.enable_remote_llm:
-            return self._deterministic_plan(transcript=transcript, app_name=active_app_name, warnings=["Remote planner disabled"])
+            return self._deterministic_plan(
+                transcript=transcript,
+                app_name=active_app_name,
+                warnings=["Remote planner disabled"],
+                loop_context=loop_context,
+            )
 
         key = self.current_api_key()
         if not key:
@@ -177,6 +219,7 @@ class MacOSUseAdapter:
             active_app_name=active_app_name,
             ax_tree_summary=_ax_tree_summary,
             api_key=key,
+            loop_context=loop_context,
         )
 
     async def _plan_with_anthropic(
@@ -186,16 +229,17 @@ class MacOSUseAdapter:
         active_app_name: str | None,
         ax_tree_summary: str | None,
         api_key: str,
+        loop_context: LoopContext | None,
     ) -> AdapterResult:
         model = self._select_model(transcript, active_app_name=active_app_name)
         prompt = self._build_provider_prompt(
             transcript=transcript,
             active_app_name=active_app_name,
             ax_tree_summary=ax_tree_summary,
+            loop_context=loop_context,
         )
 
         payload: dict[str, Any] = {
-            "model": model,
             "temperature": 0,
             "max_tokens": 900,
             "system": "You are Orange planner. Return only valid JSON. Do not include markdown.",
@@ -204,86 +248,150 @@ class MacOSUseAdapter:
             ],
         }
 
-        url = f"{settings.anthropic_api_base.rstrip('/')}/v1/messages"
+        url = f"{self._api_base()}/v1/messages"
         headers = {
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=24.0) as client:
-                response = await client.post(url, headers=headers, json=payload)
-        except httpx.RequestError as exc:
-            raise ProviderConfigurationError(
-                f"Network error while contacting Anthropic: {exc.__class__.__name__}",
-                status_code=503,
-                error_code="provider_network_error",
-            ) from exc
+        planning_timeout = httpx.Timeout(
+            timeout=settings.anthropic_plan_timeout_seconds,
+            connect=min(10.0, settings.anthropic_plan_timeout_seconds),
+        )
 
-        if response.status_code in {401, 403}:
-            raise ProviderConfigurationError(
-                "Anthropic API key is invalid or unauthorized.",
-                status_code=401,
-                error_code="invalid_api_key",
-            )
-        if response.status_code == 429:
-            raise ProviderConfigurationError(
-                "Anthropic quota or rate limit exceeded.",
-                status_code=429,
-                error_code="provider_quota_exceeded",
-            )
-        if response.status_code >= 500:
-            raise ProviderConfigurationError(
-                "Anthropic service is temporarily unavailable.",
-                status_code=503,
-                error_code="provider_unavailable",
-            )
-        if response.status_code >= 300:
-            raise ProviderConfigurationError(
-                f"Anthropic returned unexpected status {response.status_code}.",
-                status_code=502,
-                error_code="provider_bad_response",
-            )
+        model_candidates = self._model_candidates(model)
+        parse_warnings: list[str] = []
 
-        body = response.json()
-        content_text = self._extract_text_content(body)
-        if not content_text:
-            return self._deterministic_plan(
-                transcript=transcript,
-                app_name=active_app_name,
-                warnings=["Provider returned empty content"],
-            )
+        for idx, attempt_model in enumerate(model_candidates):
+            payload["model"] = attempt_model
+            try:
+                async with httpx.AsyncClient(timeout=planning_timeout) as client:
+                    response = await client.post(url, headers=headers, json=payload)
+            except httpx.RequestError as exc:
+                raise ProviderConfigurationError(
+                    f"Network error while contacting Anthropic: {exc.__class__.__name__}",
+                    status_code=503,
+                    error_code="provider_network_error",
+                ) from exc
 
-        parsed_payload = self._extract_json_payload(content_text)
-        if parsed_payload is None:
-            return self._deterministic_plan(
-                transcript=transcript,
-                app_name=active_app_name,
-                warnings=["Provider response was not valid JSON"],
-            )
+            try:
+                response_body: dict[str, Any] = response.json()
+            except Exception:
+                response_body = {}
 
-        actions, warnings = self._coerce_actions(parsed_payload.get("actions", []))
-        if not actions:
-            warnings = warnings or ["Provider returned no valid actions"]
+            if response.status_code in {401, 403}:
+                raise ProviderConfigurationError(
+                    "Anthropic API key is invalid or unauthorized.",
+                    status_code=401,
+                    error_code="invalid_api_key",
+                )
+            if response.status_code == 429:
+                raise ProviderConfigurationError(
+                    "Anthropic quota or rate limit exceeded.",
+                    status_code=429,
+                    error_code="provider_quota_exceeded",
+                )
+            if response.status_code >= 500:
+                raise ProviderConfigurationError(
+                    "Anthropic service is temporarily unavailable.",
+                    status_code=503,
+                    error_code="provider_unavailable",
+                )
+
+            if response.status_code == 404:
+                if idx < len(model_candidates) - 1:
+                    parse_warnings.append(f"Model {attempt_model} unavailable, trying fallback model")
+                    continue
+                warning_reason = (
+                    "Provider returned 404 for primary model"
+                    if self._looks_like_model_not_found(response_body)
+                    else "Provider returned 404"
+                )
+                parse_warnings.append(warning_reason)
+                return self._deterministic_plan(
+                    transcript=transcript,
+                    app_name=active_app_name,
+                    warnings=[*parse_warnings],
+                    loop_context=loop_context,
+                )
+
+            if response.status_code >= 300:
+                raise ProviderConfigurationError(
+                    f"Anthropic returned unexpected status {response.status_code}.",
+                    status_code=502,
+                    error_code="provider_bad_response",
+                )
+
+            body = response_body
+            content_text = self._extract_text_content(body)
+            if not content_text:
+                return self._deterministic_plan(
+                    transcript=transcript,
+                    app_name=active_app_name,
+                    warnings=["Provider returned empty content", *parse_warnings],
+                    loop_context=loop_context,
+                )
+
+            parsed_payload = self._extract_json_payload(content_text)
+            if parsed_payload is None:
+                return self._deterministic_plan(
+                    transcript=transcript,
+                    app_name=active_app_name,
+                    warnings=["Provider response was not valid JSON", *parse_warnings],
+                    loop_context=loop_context,
+                )
+
+            actions, plan_warnings = self._coerce_actions(parsed_payload.get("actions", []))
+            actions = self._enforce_loop_state_actions(
+                actions=actions,
+                loop_context=loop_context,
+            )
+            if not actions:
+                plan_warnings = plan_warnings or ["Provider returned no valid actions"]
+                warnings = list(parse_warnings)
+                warnings.extend(plan_warnings)
+                return AdapterResult(
+                    actions=[
+                        Action(
+                            id="a1",
+                            kind="wait",
+                            timeout_ms=1000,
+                            expected_outcome="Awaiting user clarification",
+                        )
+                    ],
+                    confidence=0.2,
+                    summary="Unable to parse safe actions from planner output",
+                    warnings=warnings,
+                    goal_state="blocked",
+                    planner_note="Planner output could not be parsed safely.",
+                    recovery_guidance="Try a shorter command or mention the app and target explicitly.",
+                )
+
+            confidence = self._clamp_confidence(parsed_payload.get("confidence"))
+            summary = str(parsed_payload.get("summary") or "Anthropic generated plan")
+            goal_state = self._coerce_goal_state(parsed_payload, actions=actions, loop_context=loop_context)
+            planner_note = cast_optional_str(parsed_payload.get("planner_note"))
+            if attempt_model != model:
+                fallback_note = f"[fallback model: {attempt_model}]"
+                planner_note = (
+                    f"{fallback_note} {planner_note}" if planner_note else fallback_note
+                ).strip()
             return AdapterResult(
-                actions=[
-                    Action(
-                        id="a1",
-                        kind="wait",
-                        timeout_ms=1000,
-                        expected_outcome="Awaiting user clarification",
-                    )
-                ],
-                confidence=0.2,
-                summary="Unable to parse safe actions from planner output",
-                warnings=warnings,
-                recovery_guidance="Try a shorter command or mention the app and target explicitly.",
+                actions=actions,
+                confidence=confidence,
+                summary=summary,
+                warnings=parse_warnings + plan_warnings,
+                goal_state=goal_state,
+                planner_note=planner_note,
             )
 
-        confidence = self._clamp_confidence(parsed_payload.get("confidence"))
-        summary = str(parsed_payload.get("summary") or "Anthropic generated plan")
-        return AdapterResult(actions=actions, confidence=confidence, summary=summary, warnings=warnings)
+        return self._deterministic_plan(
+            transcript=transcript,
+            app_name=active_app_name,
+            warnings=["Provider model retries exhausted"],
+            loop_context=loop_context,
+        )
 
     def _extract_text_content(self, payload: dict[str, Any]) -> str | None:
         content = payload.get("content")
@@ -328,14 +436,37 @@ class MacOSUseAdapter:
                 warnings.append(f"Rejected unknown action kind '{kind or 'missing'}' at index {idx}")
                 continue
             try:
+                target = cast_optional_str(raw.get("target"))
+                text = cast_optional_str(raw.get("text"))
+                key_combo = cast_optional_str(raw.get("key_combo"))
+                app_bundle_id = cast_optional_str(raw.get("app_bundle_id"))
+                invalid_fields = self._missing_required_fields(
+                    kind=kind,
+                    target=target,
+                    text=text,
+                    key_combo=key_combo,
+                    app_bundle_id=app_bundle_id,
+                )
+                if invalid_fields:
+                    warnings.append(
+                        f"Rejected invalid action at index {idx}: missing required field(s) {', '.join(invalid_fields)} for kind '{kind}'"
+                    )
+                    continue
+                if kind in {"click", "double_click", "select_menu_item", "scroll"} and self._looks_like_placeholder_target(
+                    target
+                ):
+                    warnings.append(
+                        f"Rejected invalid action at index {idx}: placeholder target '{target}' for kind '{kind}'"
+                    )
+                    continue
                 actions.append(
                     Action(
                         id=str(raw.get("id") or f"a{idx}"),
                         kind=kind,  # type: ignore[arg-type]
-                        target=cast_optional_str(raw.get("target")),
-                        text=cast_optional_str(raw.get("text")),
-                        key_combo=cast_optional_str(raw.get("key_combo")),
-                        app_bundle_id=cast_optional_str(raw.get("app_bundle_id")),
+                        target=target,
+                        text=text,
+                        key_combo=key_combo,
+                        app_bundle_id=app_bundle_id,
                         timeout_ms=cast_int(raw.get("timeout_ms"), default=3000),
                         destructive=bool(raw.get("destructive", False)),
                         expected_outcome=cast_optional_str(raw.get("expected_outcome")),
@@ -346,28 +477,195 @@ class MacOSUseAdapter:
                 continue
         return actions, warnings
 
+    @staticmethod
+    def _looks_like_placeholder_target(target: str | None) -> bool:
+        if not target:
+            return True
+        normalized = re.sub(r"\s+", " ", target.strip().lower())
+        explicit_placeholders = {
+            "first_search_result",
+            "search_result",
+            "first result",
+            "top result",
+            "search bar",
+            "search field",
+            "current field",
+            "focused field",
+            "input field",
+        }
+        if normalized in explicit_placeholders:
+            return True
+        if normalized.startswith("first_") and normalized.endswith("_result"):
+            return True
+        return False
+
+    @staticmethod
+    def _missing_required_fields(
+        *,
+        kind: str,
+        target: str | None,
+        text: str | None,
+        key_combo: str | None,
+        app_bundle_id: str | None,
+    ) -> list[str]:
+        missing: list[str] = []
+        if kind in {"click", "double_click", "select_menu_item", "scroll"} and not target:
+            missing.append("target")
+        if kind == "open_app" and not target and not app_bundle_id:
+            missing.append("target|app_bundle_id")
+        if kind in {"type", "run_applescript"} and not text:
+            missing.append("text")
+        if kind == "key_combo" and not key_combo:
+            missing.append("key_combo")
+        return missing
+
+    def _enforce_loop_state_actions(
+        self,
+        *,
+        actions: list[Action],
+        loop_context: LoopContext | None,
+    ) -> list[Action]:
+        if not loop_context:
+            return actions
+
+        expected_state = loop_context.next_required_state
+        if expected_state not in {"COMMIT_ATTEMPTED", "COMPLETED"}:
+            return actions
+
+        filtered: list[Action] = []
+        for action in actions:
+            if action.kind == "open_app":
+                continue
+            if action.kind == "type":
+                continue
+            if action.kind == "key_combo":
+                combo = (action.key_combo or "").strip().lower().replace(" ", "")
+                if combo in {"cmd+n", "command+n", "tab"}:
+                    continue
+            filtered.append(action)
+
+        if expected_state == "COMPLETED":
+            # Completion phase should not reopen/retype; only confirm/commit.
+            filtered = [action for action in filtered if self._is_commit_action(action) or action.kind == "wait"]
+
+        if not any(self._is_commit_action(action) for action in filtered):
+            filtered.insert(
+                0,
+                Action(
+                    id="a1",
+                    kind="key_combo",
+                    key_combo="return",
+                    timeout_ms=900,
+                    expected_outcome="Commit current form",
+                ),
+            )
+
+        return self._reindex_actions(filtered[:3])
+
+    @staticmethod
+    def _is_commit_action(action: Action) -> bool:
+        if action.kind == "key_combo":
+            combo = (action.key_combo or "").strip().lower().replace(" ", "")
+            return combo in {
+                "enter",
+                "return",
+                "cmd+enter",
+                "command+enter",
+                "cmd+return",
+                "command+return",
+                "cmd+s",
+                "command+s",
+            }
+        if action.kind == "select_menu_item":
+            target = (action.target or "").strip().lower()
+            return any(token in target for token in ("save", "done", "ok", "confirm"))
+        return False
+
+    @staticmethod
+    def _reindex_actions(actions: list[Action]) -> list[Action]:
+        return [action.model_copy(update={"id": f"a{idx}"}) for idx, action in enumerate(actions, start=1)]
+
     def _build_provider_prompt(
         self,
         *,
         transcript: str,
         active_app_name: str | None,
         ax_tree_summary: str | None,
+        loop_context: LoopContext | None,
     ) -> str:
         app_name = active_app_name or "Unknown"
         ax_preview = (ax_tree_summary or "")[:3500]
         app_pack = self._app_prompt_pack(app_name)
         vendor_rules = self._important_rules[:2400] if self._important_rules else ""
+        loop_text = "none"
+        if loop_context:
+            recent_outcomes = self._format_recent_outcomes(loop_context.recent_action_results)
+            loop_text = (
+                f"goal={loop_context.goal_transcript}; "
+                f"cycle_index={loop_context.cycle_index}; "
+                f"replan_count={loop_context.replan_count}; "
+                f"max_cycles={loop_context.max_cycles}; "
+                f"max_replans={loop_context.max_replans}; "
+                f"current_state={loop_context.current_state}; "
+                f"next_required_state={loop_context.next_required_state}; "
+                f"last_state={loop_context.last_state}; "
+                f"last_verify_status={loop_context.last_verify_status}; "
+                f"last_verify_reason={loop_context.last_verify_reason}; "
+                f"recent_action_results={recent_outcomes}"
+            )
         return (
             "Plan safe macOS actions for this user request.\n"
+            "This is a stepwise autonomous loop. Plan only the NEXT micro-step (1-3 actions), not the whole task.\n"
             "Return strictly JSON with shape: "
-            '{"summary":"...", "confidence":0.0-1.0, "actions":[{"id":"a1","kind":"open_app|click|type|key_combo|scroll|run_applescript|select_menu_item|wait","target":null,"text":null,"key_combo":null,"app_bundle_id":null,"timeout_ms":3000,"destructive":false,"expected_outcome":null}]}\n'
+            '{"summary":"...", "confidence":0.0-1.0, "goal_state":"in_progress|complete|blocked", "planner_note":"...", "actions":[{"id":"a1","kind":"open_app|click|double_click|type|key_combo|scroll|run_applescript|select_menu_item|wait","target":null,"text":null,"key_combo":null,"app_bundle_id":null,"timeout_ms":3000,"destructive":false,"expected_outcome":null}]}\n'
             "Use the fewest actions needed.\n"
+            "If previous cycle failed, do not repeat the same failed action target/text combo.\n"
+            "If loop_context.current_state and loop_context.next_required_state are present, plan explicitly toward that transition target.\n"
+            "Field discipline policy (applies to any form UI):\n"
+            "- A type action must target the currently focused field only. If focus is uncertain, add a focus action first (tab/click/key_combo) before typing.\n"
+            "- Never type the full user transcript/command sentence into a field. Extract only task data values.\n"
+            "- Click-like actions (click/double_click/select_menu_item/scroll) must have a non-empty target. If target is unknown, do not emit click; use key_combo focus navigation or wait.\n"
+            "- Never use placeholder targets such as first_search_result/search_bar/current_field. Use an actual AX label/index from AX summary.\n"
+            "- Treat title/date/time/location/body as separate slots. Never place time/date text into a title/name field.\n"
+            "- Do not emit two type actions for different slots back-to-back unless there is an explicit focus-change action between them.\n"
+            "- If micro-step budget (1-3 actions) is tight, fill one slot and end with a navigation/commit action; continue next slot in the next cycle.\n"
+            "State transition policy:\n"
+            "- current_state=APP_ACTIVE: ensure the correct app/context is active or opened only once.\n"
+            "- current_state=UI_CONTEXT_CHANGED: move focus to the intended control (tab/arrow/click), avoid retyping the whole task.\n"
+            "- current_state=DATA_ENTERED: do not emit another type action for title/time/body again. Prefer progress actions (tab, return, key_combo save/commit, menu item save/Done).\n"
+            "- current_state=COMMIT_ATTEMPTED: verify completion and, if needed, open/locate a clear save/confirm result.\n"
+            "- If next_required_state=COMMIT_ATTEMPTED, do not use create-new-item shortcuts (for example cmd+n); perform commit/save/confirm actions only.\n"
+            "- If data was already typed in a form-like workflow, next cycle should finalize/commit, then verify completion.\n"
+            "If a click failed, try an alternative strategy (menu item, key combo, focus step, or wait).\n"
+            "If a previous cycle replan was needed, and this cycle still reports no progress, change strategy immediately (shortcut-first/menu path) and do not retry identical action signatures.\n"
+            "For form tasks, prefer stable key_combo shortcuts and focus navigation before brittle click paths.\n"
+            "Prefer actionable controls (buttons, menu items, text fields) and avoid static text labels.\n"
+            "Do not call open_app for the currently active app unless the command requires switching to a different app.\n"
+            "If last_verify_status is success, continue with the next workflow step instead of reopening the same app.\n"
+            "When context already shows the target app, avoid emitting open_app on that same app in consecutive cycles.\n"
+            "If task is complete from current context, return goal_state=complete and actions=[].\n"
+            "If blocked and cannot proceed safely, return goal_state=blocked with planner_note.\n"
             f"Active app: {app_name}\n"
             f"User transcript: {transcript}\n"
+            f"Loop context: {loop_text}\n"
             f"AX summary: {ax_preview}\n"
             f"App-specific guidance: {app_pack}\n"
             f"Safety rules excerpt: {vendor_rules}\n"
         )
+
+    @staticmethod
+    def _format_recent_outcomes(outcomes: list) -> str:
+        if not outcomes:
+            return "none"
+        rendered: list[str] = []
+        for outcome in outcomes[-6:]:
+            hint = (outcome.action_hint or "").strip() if hasattr(outcome, "action_hint") else ""
+            if len(hint) > 120:
+                hint = hint[:120]
+            rendered.append(
+                f"{outcome.kind}:{outcome.status}:error={outcome.error_code or 'none'}:hint={hint or 'n/a'}"
+            )
+        return " | ".join(rendered)
 
     def _select_model(self, transcript: str, *, active_app_name: str | None) -> str:
         if active_app_name:
@@ -388,7 +686,6 @@ class MacOSUseAdapter:
             "safari": "Use cmd+l for address bar and confirm page load target.",
             "google chrome": "Use cmd+l for omnibox and verify URL matches intent.",
             "finder": "Prefer menu actions for create/rename/move and avoid destructive operations by default.",
-            "calendar": "Use event title/date/time verification before final save.",
         }
         return packs.get(key, "Use safest deterministic actions and avoid irreversible operations.")
 
@@ -400,9 +697,26 @@ class MacOSUseAdapter:
             confidence = 0.7
         return max(0.0, min(1.0, confidence))
 
-    def _deterministic_plan(self, *, transcript: str, app_name: str | None, warnings: list[str]) -> AdapterResult:
+    def _deterministic_plan(
+        self,
+        *,
+        transcript: str,
+        app_name: str | None,
+        warnings: list[str],
+        loop_context: LoopContext | None,
+    ) -> AdapterResult:
         text = transcript.strip().lower()
         app_name = (app_name or "").strip()
+        if loop_context and loop_context.cycle_index >= loop_context.max_cycles:
+            return AdapterResult(
+                actions=[],
+                confidence=0.6,
+                summary="Loop budget reached",
+                warnings=warnings,
+                goal_state="blocked",
+                planner_note="No further planning due to cycle budget limits.",
+                recovery_guidance="Ask user for clarification or a narrower request.",
+            )
 
         if text.startswith("open "):
             target = transcript.strip()[5:].strip()
@@ -418,6 +732,7 @@ class MacOSUseAdapter:
                 confidence=0.82,
                 summary=f"Open {target}",
                 warnings=warnings,
+                goal_state="in_progress",
                 recovery_guidance="Fell back to deterministic planner due to provider output issues.",
             )
 
@@ -436,6 +751,7 @@ class MacOSUseAdapter:
                 confidence=0.75,
                 summary=f"Navigate to {url}",
                 warnings=warnings,
+                goal_state="in_progress",
                 recovery_guidance="Fell back to deterministic planner due to provider output issues.",
             )
 
@@ -451,8 +767,37 @@ class MacOSUseAdapter:
             confidence=0.55,
             summary="Type transcript in focused field",
             warnings=warnings,
+            goal_state="in_progress",
             recovery_guidance="Fell back to deterministic planner due to provider output issues.",
         )
+
+    @staticmethod
+    def _coerce_goal_state(
+        payload: dict[str, Any],
+        *,
+        actions: list[Action],
+        loop_context: LoopContext | None,
+    ) -> str:
+        raw = str(payload.get("goal_state") or "").strip().lower()
+        if raw in {"in_progress", "complete", "blocked"}:
+            return raw
+
+        if isinstance(payload.get("done"), bool) and payload.get("done") is True:
+            return "complete"
+
+        if (
+            loop_context
+            and loop_context.current_state == "COMMIT_ATTEMPTED"
+            and loop_context.next_required_state == "COMPLETED"
+            and loop_context.last_verify_status == "success"
+        ):
+            return "complete"
+
+        if not actions:
+            if loop_context and loop_context.cycle_index >= loop_context.max_cycles:
+                return "blocked"
+            return "complete"
+        return "in_progress"
 
     @staticmethod
     def _key_hint(key: str) -> str:

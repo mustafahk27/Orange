@@ -397,7 +397,10 @@ struct OrangeApp: App {
             "Keychain key: \(keyHint)",
             "Gate: \(appState.onboardingGate.rawValue)",
             "Permissions: accessibility=\(permission.accessibility), mic=\(permission.microphone), screen=\(permission.screenRecording)",
-            "Sidecar healthy: \(appState.sidecarHealthy)"
+            "Sidecar healthy: \(appState.sidecarHealthy)",
+            "",
+            "Recent logs:",
+            Logger.recentMessages().joined(separator: "\n")
         ].joined(separator: "\n")
     }
 
@@ -447,6 +450,12 @@ struct OrangeApp: App {
             },
             onCancel: {
                 sessionManager.cancel(state: appState)
+            },
+            onDiagnostics: {
+                Task {
+                    await loadDiagnostics()
+                    showDiagnostics = true
+                }
             }
         )
     }

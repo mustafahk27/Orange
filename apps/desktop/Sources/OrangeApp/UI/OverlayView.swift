@@ -6,6 +6,7 @@ struct OverlayView: View {
     let onStop: () -> Void
     let onConfirm: () -> Void
     let onCancel: () -> Void
+    let onDiagnostics: () -> Void
 
     @State private var isPointerInside = false
     @State private var hoverExpanded = false
@@ -250,6 +251,13 @@ struct OverlayView: View {
 
                 Spacer()
 
+                Button(action: onDiagnostics) {
+                    Text("Diagnostics")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.45))
+                }
+                .buttonStyle(.plain)
+
                 Text("F8")
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.25))
@@ -276,6 +284,7 @@ struct OverlayView: View {
     private func iconForAction(_ kind: ActionKind) -> String {
         switch kind {
         case .click: return "cursorarrow.click"
+        case .doubleClick: return "cursorarrow.click.2"
         case .type: return "keyboard"
         case .keyCombo: return "command"
         case .scroll: return "scroll"

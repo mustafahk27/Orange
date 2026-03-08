@@ -5,6 +5,7 @@ import Speech
 struct TranscriptResult {
     let fullText: String
     let partials: [String]
+    let confidence: Double
 }
 
 protocol SpeechToTextService {
@@ -44,6 +45,7 @@ final class AppleSpeechRecognizer: NSObject, SpeechToTextService {
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var partialHandler: (@Sendable (String) -> Void)?
+    private var latestConfidence = 0.0
 
     private var latestTranscript = ""
     private var partials: [String] = []
@@ -76,12 +78,16 @@ final class AppleSpeechRecognizer: NSObject, SpeechToTextService {
         let elapsed = Date().timeIntervalSince(startedAt ?? Date())
         Logger.info("STT stopped after \(elapsed)s")
 
-        let snapshot = lock.withLock { (latestTranscript, partials) }
+        let snapshot = lock.withLock { (latestTranscript, partials, latestConfidence) }
         let text = snapshot.0.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty {
             throw SpeechRecognitionError.emptyTranscript
         }
-        return TranscriptResult(fullText: text, partials: snapshot.1)
+        return TranscriptResult(
+            fullText: text,
+            partials: snapshot.1,
+            confidence: snapshot.2
+        )
     }
 
     func cancel() {
@@ -148,6 +154,7 @@ final class AppleSpeechRecognizer: NSObject, SpeechToTextService {
             if let result {
                 let text = result.bestTranscription.formattedString
                 self.lock.withLock {
+                    self.latestConfidence = Self.transcriptionConfidence(from: result)
                     self.latestTranscript = text
                     if self.partials.last != text {
                         self.partials.append(text)
@@ -175,6 +182,7 @@ final class AppleSpeechRecognizer: NSObject, SpeechToTextService {
             latestTranscript = ""
             partials = []
             startError = nil
+            latestConfidence = 0.0
         }
     }
 
@@ -184,6 +192,17 @@ final class AppleSpeechRecognizer: NSObject, SpeechToTextService {
             audioEngine.inputNode.removeTap(onBus: 0)
         }
         recognitionRequest?.endAudio()
+    }
+
+    private static func transcriptionConfidence(from result: SFSpeechRecognitionResult) -> Double {
+        let segments = result.bestTranscription.segments
+        guard !segments.isEmpty else {
+            return 0.0
+        }
+        let total = segments.reduce(0.0) { accumulator, segment in
+            accumulator + Double(segment.confidence)
+        }
+        return min(1.0, max(0.0, total / Double(segments.count)))
     }
 }
 

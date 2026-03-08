@@ -12,8 +12,18 @@ final class PythonSidecarManager {
     func startIfNeeded(apiKey: String?) {
         launchAPIKey = apiKey
         if process?.isRunning == true || isStarting { return }
-        restartAttempts = 0
-        startProcess()
+        isStarting = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if await self.isHealthy() {
+                self.isStarting = false
+                self.restartAttempts = 0
+                Logger.info("Using existing sidecar on 127.0.0.1:7789")
+                return
+            }
+            self.restartAttempts = 0
+            self.startProcess()
+        }
     }
 
     func restart(apiKey: String?) {
@@ -46,7 +56,7 @@ final class PythonSidecarManager {
         p.terminationHandler = { [weak self] terminated in
             guard let self else { return }
             Task { @MainActor in
-                self.handleTermination(terminated)
+                await self.handleTermination(terminated)
             }
         }
 
@@ -165,12 +175,18 @@ final class PythonSidecarManager {
         }
     }
 
-    private func handleTermination(_ terminated: Process) {
+    private func handleTermination(_ terminated: Process) async {
         guard !isStopping else { return }
         let status = terminated.terminationStatus
         let reason = terminated.terminationReason == .exit ? "exit" : "uncaught_signal"
         Logger.error("Sidecar terminated reason=\(reason) status=\(status)")
         process = nil
+        if await isHealthy() {
+            isStarting = false
+            restartAttempts = 0
+            Logger.info("Existing sidecar remained healthy after termination; skipping restart")
+            return
+        }
         restartIfNeeded(reason: "terminated")
     }
 
